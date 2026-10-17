@@ -67,7 +67,10 @@ use vmm::vmm_config::vsock::VsockDeviceConfig;
 use aws_nitro::enclave::NitroEnclave;
 
 #[cfg(feature = "gpu")]
-use devices::virtio::display::{DisplayInfoEdid, PhysicalSize, MAX_DISPLAYS};
+use devices::virtio::display::{
+    DisplayInfoEdid, PhysicalSize, MAX_DISPLAYS, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH,
+    MAX_REFRESH_RATE,
+};
 #[cfg(feature = "input")]
 use krun_input::{InputConfigBackend, InputEventProviderBackend};
 
@@ -1734,6 +1737,11 @@ pub unsafe extern "C" fn krun_add_display(ctx_id: u32, width: u32, height: u32) 
             if cfg.vmr.displays.len() >= MAX_DISPLAYS {
                 return -libc::ENOMEM;
             }
+            if !(1..=MAX_DISPLAY_WIDTH).contains(&width)
+                || !(1..=MAX_DISPLAY_HEIGHT).contains(&height)
+            {
+                return -libc::EINVAL;
+            }
 
             cfg.vmr.displays.push(DisplayInfo::new(width, height));
             (cfg.vmr.displays.len() - 1) as i32
@@ -1764,6 +1772,9 @@ pub extern "C" fn krun_display_set_refresh_rate(
         let DisplayInfoEdid::Generated(ref mut edid_params) = display_info.edid else {
             return -libc::EALREADY;
         };
+        if !(1..=MAX_REFRESH_RATE).contains(&refresh_rate) {
+            return -libc::EINVAL;
+        }
 
         edid_params.refresh_rate = refresh_rate;
         KRUN_SUCCESS
@@ -3212,6 +3223,46 @@ mod test_balloon_free_page_reporting_mode {
             krun_set_balloon_free_page_reporting_mode(ctx, KRUN_FREE_PAGE_REPORTING_MODE_REPLACE),
             -libc::ENOENT
         );
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod test_display_limits {
+    use super::*;
+
+    #[test]
+    fn test_add_display_size_limits() {
+        let ctx = krun_create_ctx() as u32;
+        for (width, height) in [(0, 768), (1366, 0), (8193, 768), (1366, 8193)] {
+            assert_eq!(
+                unsafe { krun_add_display(ctx, width, height) },
+                -libc::EINVAL,
+                "{width}x{height}"
+            );
+        }
+        assert_eq!(unsafe { krun_add_display(ctx, 8192, 8192) }, 0);
+        assert_eq!(unsafe { krun_add_display(ctx, 1, 1) }, 1);
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
+    }
+
+    #[test]
+    fn test_display_set_refresh_rate_limits() {
+        let ctx = krun_create_ctx() as u32;
+        let display = unsafe { krun_add_display(ctx, 1920, 1080) } as u32;
+        assert_eq!(
+            krun_display_set_refresh_rate(ctx, display, 0),
+            -libc::EINVAL
+        );
+        assert_eq!(
+            krun_display_set_refresh_rate(ctx, display, 2326),
+            -libc::EINVAL
+        );
+        assert_eq!(krun_display_set_refresh_rate(ctx, display, 1), KRUN_SUCCESS);
+        assert_eq!(
+            krun_display_set_refresh_rate(ctx, display, 2325),
+            KRUN_SUCCESS
+        );
+        assert_eq!(krun_free_ctx(ctx), KRUN_SUCCESS);
     }
 }
 

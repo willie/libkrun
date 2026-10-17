@@ -62,6 +62,13 @@ impl DisplayInfo {
 
 pub const MAX_DISPLAYS: usize = VIRTIO_GPU_MAX_SCANOUTS as usize;
 
+/// The largest display width and height: XRES_MAX and YRES_MAX in Linux's
+/// virtio-gpu driver, which prunes a larger mode.
+pub const MAX_DISPLAY_WIDTH: u32 = 8192;
+pub const MAX_DISPLAY_HEIGHT: u32 = 8192;
+
+pub use super::edid::MAX_REFRESH_RATE;
+
 pub struct NoopDisplayBackend;
 
 impl DisplayBackendNew<()> for NoopDisplayBackend {

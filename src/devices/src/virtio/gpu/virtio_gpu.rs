@@ -5,18 +5,20 @@ use std::io::IoSliceMut;
 use std::os::fd::AsRawFd;
 use std::os::fd::RawFd;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::super::Queue as VirtQueue;
 use super::protocol::GpuResponse::*;
 use super::protocol::{
     GpuResponse, GpuResponsePlaneInfo, VirtioGpuResult, VIRTIO_GPU_BLOB_FLAG_CREATE_GUEST_HANDLE,
-    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_MAX_SCANOUTS,
+    VIRTIO_GPU_BLOB_MEM_HOST3D, VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_MAX_SCANOUTS,
 };
 #[cfg(target_os = "macos")]
 use crossbeam_channel::{unbounded, Sender};
 use krun_display::{
-    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendInstance, Rect, ResourceFormat,
+    DisplayBackend, DisplayBackendBasicFramebuffer, DisplayBackendError, DisplayBackendInstance, Rect,
+    ResourceFormat,
 };
 use libc::c_void;
 #[cfg(target_os = "macos")]
@@ -29,9 +31,10 @@ use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_OPAQUE_FD;
 use rutabaga_gfx::RUTABAGA_MEM_HANDLE_TYPE_SHM;
 use rutabaga_gfx::{
     ResourceCreate3D, ResourceCreateBlob, Rutabaga, RutabagaBuilder, RutabagaChannel,
-    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, RutabagaResult, Transfer3D,
-    RUTABAGA_CHANNEL_TYPE_WAYLAND, RUTABAGA_MAP_CACHE_MASK,
+    RutabagaFence, RutabagaFenceHandler, RutabagaIovec, Transfer3D, RUTABAGA_CHANNEL_TYPE_WAYLAND,
+    RUTABAGA_MAP_CACHE_MASK,
 };
+use rutabaga_gfx::{AsRawDescriptor, RutabagaHandle};
 use rutabaga_gfx::{RutabagaDescriptor, RutabagaFromRawDescriptor};
 #[cfg(target_os = "linux")]
 use rutabaga_gfx::{
@@ -43,7 +46,7 @@ use utils::worker_message::WorkerMessage;
 use vm_memory::{GuestAddress, GuestMemory, GuestMemoryMmap};
 
 use super::{GpuError, Result};
-use crate::virtio::display::DisplayInfo;
+use crate::virtio::display::{DisplayInfo, MAX_DISPLAY_HEIGHT, MAX_DISPLAY_WIDTH};
 use crate::virtio::fs::ExportTable;
 use crate::virtio::gpu::protocol::VIRTIO_GPU_FLAG_INFO_RING_IDX;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
@@ -149,6 +152,18 @@ pub struct VirtioGpuScanout {
     resource_id: u32,
     width: u32,
     height: u32,
+    /// For a blob scanout, where its pixels are in the blob.
+    blob: Option<ScanoutBlob>,
+}
+
+/// The layout of a blob scanout's first plane: the byte offset of its
+/// top-left pixel in the blob and the distance between rows.
+#[derive(Clone, Copy)]
+pub struct ScanoutBlob {
+    pub offset: u64,
+    pub stride: u32,
+    /// The virtio-gpu format, for the display backend.
+    pub format: u32,
 }
 
 pub struct VirtioGpu {
@@ -159,7 +174,12 @@ pub struct VirtioGpu {
     map_sender: Sender<WorkerMessage>,
     scanouts: [Option<VirtioGpuScanout>; VIRTIO_GPU_MAX_SCANOUTS as usize],
     displays: Box<[DisplayInfo]>,
+    /// The newest size the display backend asked for, per display.
+    requested_sizes: Box<[(u32, u32)]>,
     display_backend: DisplayBackendInstance,
+    /// Blobs the display backend shows from their own memory
+    /// (`present_blob`), with their exported descriptors.
+    blob_exports: BTreeMap<u32, Arc<RutabagaHandle>>,
 }
 
 impl VirtioGpu {
@@ -359,8 +379,10 @@ impl VirtioGpu {
             resources: Default::default(),
             fence_state,
             scanouts: Default::default(),
+            requested_sizes: displays.iter().map(|d| (d.width, d.height)).collect(),
             displays,
             display_backend,
+            blob_exports: Default::default(),
             #[cfg(target_os = "macos")]
             map_sender,
         }
@@ -427,6 +449,13 @@ impl VirtioGpu {
             .resources
             .remove(&resource_id)
             .ok_or(ErrInvalidResourceId)?;
+
+        if self.blob_exports.remove(&resource_id).is_some() {
+            match self.display_backend.release_blob(resource_id) {
+                Ok(()) | Err(DisplayBackendError::MethodNotSupported) => {}
+                Err(e) => warn!("Failed to release blob {resource_id} on the display: {e:?}"),
+            }
+        }
 
         if resource.scanouts.has_any_enabled() {
             warn!(
@@ -505,32 +534,128 @@ impl VirtioGpu {
             resource_id,
             width,
             height,
+            blob: None,
         });
         Ok(OkNoData)
     }
 
-    // The resource can be larger than the scanout, but the frame only holds
-    // the scanout.
+    /// Shows `width` x `height` of a blob resource (a GPU buffer) on the
+    /// scanout; flushes copy its rows from the blob's host memory.
+    #[allow(clippy::too_many_arguments)]
+    pub fn set_scanout_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        blob: ScanoutBlob,
+    ) -> VirtioGpuResult {
+        if resource_id == 0 {
+            return self.set_scanout(scanout_id, 0, width, height);
+        }
+        // Everything that can fail comes before the scanout and the
+        // resources change, so a failure leaves them as they were.
+        if !self.resources.contains_key(&resource_id) {
+            return Err(ErrInvalidResourceId);
+        }
+        let format = ResourceFormat::try_from(format).map_err(|_| {
+            warn!("Cannot show a blob with unknown format {format} on scanout {scanout_id}");
+            ErrUnspec
+        })?;
+        let display_info = self
+            .displays
+            .get(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+        self.display_backend.configure_scanout(
+            scanout_id,
+            display_info.width,
+            display_info.height,
+            width,
+            height,
+            format,
+        )?;
+
+        let scanout = self
+            .scanouts
+            .get_mut(scanout_id as usize)
+            .ok_or(ErrInvalidScanoutId)?;
+        if let Some(previous) = scanout.as_ref().map(|scanout| scanout.resource_id) {
+            if let Some(resource) = self.resources.get_mut(&previous) {
+                resource.scanouts.disable(scanout_id);
+            }
+        }
+        // Checked above.
+        let resource = self.resources.get_mut(&resource_id).unwrap();
+        resource.scanouts.enable(scanout_id);
+
+        *scanout = Some(VirtioGpuScanout {
+            resource_id,
+            width,
+            height,
+            blob: Some(blob),
+        });
+        Ok(OkNoData)
+    }
+
+    /// Copies a blob scanout's rows from the blob's host memory.
+    fn read_blob(
+        rutabaga: &Rutabaga,
+        resource: &VirtioGpuResource,
+        scanout: &VirtioGpuScanout,
+        blob: ScanoutBlob,
+        output: &mut [u8],
+    ) -> std::result::Result<(), String> {
+        let base = rutabaga.map_ptr(resource.id).map_err(|e| format!("{e}"))? as *const u8;
+        let row = scanout.width as usize * ResourceFormat::BYTES_PER_PIXEL;
+        // The guest picks the offset, stride and size: an overflow must not
+        // pass the check.
+        let end = u64::from(blob.stride)
+            .checked_mul(u64::from(scanout.height.saturating_sub(1)))
+            .and_then(|rows| rows.checked_add(blob.offset))
+            .and_then(|start| start.checked_add(row as u64));
+        let frame = row.checked_mul(scanout.height as usize);
+        if end.is_none_or(|end| end > resource.size) || frame.is_none_or(|n| output.len() < n) {
+            return Err(format!(
+                "scanout {}x{} at offset {} stride {} doesn't fit the blob ({} bytes) or frame",
+                scanout.width, scanout.height, blob.offset, blob.stride, resource.size
+            ));
+        }
+        for y in 0..scanout.height as usize {
+            // SAFETY: the rows lie within the blob's mapping, checked above.
+            let src = unsafe {
+                std::slice::from_raw_parts(base.add(blob.offset as usize + y * blob.stride as usize), row)
+            };
+            output[y * row..(y + 1) * row].copy_from_slice(src);
+        }
+        Ok(())
+    }
+
+    /// Reads the scanout's part of the resource (which can be larger, e.g. a
+    /// framebuffer spanning several outputs) at the scanout's stride.
     fn read_2d_resource(
         rutabaga: &mut Rutabaga,
         resource: VirtioGpuResource,
-        scanout: &VirtioGpuScanout,
+        width: u32,
+        height: u32,
         output: &mut [u8],
-    ) -> RutabagaResult<()> {
+    ) -> std::result::Result<(), String> {
         let transfer = Transfer3D {
             x: 0,
             y: 0,
             z: 0,
-            w: scanout.width.min(resource.width),
-            h: scanout.height.min(resource.height),
+            w: width.min(resource.width),
+            h: height.min(resource.height),
             d: 1,
             level: 0,
-            stride: scanout.width * ResourceFormat::BYTES_PER_PIXEL as u32,
+            stride: width * ResourceFormat::BYTES_PER_PIXEL as u32,
             layer_stride: 0,
             offset: 0,
         };
 
-        rutabaga.transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+        rutabaga
+            .transfer_read(0, resource.id, transfer, Some(IoSliceMut::new(output)))
+            .map_err(|e| format!("{e}"))
     }
 
     /// If the resource is the scanout resource, flush it to the display.
@@ -548,8 +673,20 @@ impl VirtioGpu {
             let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
                 continue;
             };
+            let (width, height, blob) = (scanout.width, scanout.height, scanout.blob);
+            if let Some(blob) = blob {
+                if self.present_blob(scanout_id, &resource, blob, width, height, &rect)? {
+                    continue;
+                }
+            }
+            let Some(Some(scanout)) = self.scanouts.get(scanout_id as usize) else {
+                continue;
+            };
             let (frame_id, buffer) = self.display_backend.alloc_frame(scanout_id)?;
-            let read = Self::read_2d_resource(&mut self.rutabaga, resource, scanout, buffer);
+            let read = match blob {
+                Some(blob) => Self::read_blob(&self.rutabaga, &resource, scanout, blob, buffer),
+                None => Self::read_2d_resource(&mut self.rutabaga, resource, width, height, buffer),
+            };
             // Present the frame even if the read failed: the display API has no
             // way to release it, and a backend may not hand out another one.
             self.display_backend
@@ -568,6 +705,148 @@ impl VirtioGpu {
         }
 
         Ok(OkNoData)
+    }
+
+    /// Shows a blob scanout from the blob's memory, if the display backend
+    /// can (false: it can't, copy instead). The blob's descriptor is exported
+    /// once and kept until the resource goes.
+    fn present_blob(
+        &mut self,
+        scanout_id: u32,
+        resource: &VirtioGpuResource,
+        blob: ScanoutBlob,
+        width: u32,
+        height: u32,
+        rect: &Rect,
+    ) -> std::result::Result<bool, GpuResponse> {
+        let export = match self.blob_exports.get(&resource.id) {
+            Some(export) => Arc::clone(export),
+            None => {
+                let Ok(export) = self.rutabaga.export_blob(resource.id) else {
+                    return Ok(false);
+                };
+                let export = Arc::new(export);
+                self.blob_exports.insert(resource.id, Arc::clone(&export));
+                export
+            }
+        };
+        match self.display_backend.present_blob(
+            scanout_id,
+            resource.id,
+            export.os_handle.as_raw_descriptor(),
+            blob.offset,
+            blob.stride,
+            width,
+            height,
+            blob.format,
+            resource.size,
+            Some(rect),
+        ) {
+            Ok(()) => Ok(true),
+            Err(DisplayBackendError::MethodNotSupported) => {
+                self.blob_exports.remove(&resource.id);
+                Ok(false)
+            }
+            Err(e) => {
+                log::error!("Failed to present blob {} on scanout {scanout_id}: {e:?}", resource.id);
+                Err(ErrUnspec)
+            }
+        }
+    }
+
+    /// The display backend's descriptor for size changes, if it has one.
+    pub fn display_resize_fd(&self) -> Option<i32> {
+        self.display_backend.resize_fd()
+    }
+
+    /// Takes the display sizes the backend has pending and applies the
+    /// newest; true if one changed, with VIRTIO_GPU_EVENT_DISPLAY set in
+    /// `events_read` for the driver.
+    ///
+    /// While the driver has a display event it hasn't acknowledged, the sizes
+    /// wait (call this again once it has): the driver reads the display info
+    /// and EDID for the event, then clears it, so a size applied before the
+    /// clear would never be read, and the two reads could see two sizes.
+    pub fn take_display_sizes(&mut self, events_read: &AtomicU32) -> bool {
+        for (id, requested) in self.requested_sizes.iter_mut().enumerate() {
+            match self.display_backend.take_display_size(id as u32) {
+                Ok(Some((width, height)))
+                    if !(1..=MAX_DISPLAY_WIDTH).contains(&width)
+                        || !(1..=MAX_DISPLAY_HEIGHT).contains(&height) =>
+                {
+                    warn!("display {id}: ignoring the size {width}x{height}")
+                }
+                Ok(Some(size)) => *requested = size,
+                Ok(None) => {}
+                Err(e) => warn!("display {id}: taking its new size: {e:?}"),
+            }
+        }
+        // Only the driver clears the bit, and only this thread sets it.
+        if events_read.load(Ordering::Acquire) & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+            return false;
+        }
+        let mut changed = false;
+        for (id, (display, &(width, height))) in self
+            .displays
+            .iter_mut()
+            .zip(&self.requested_sizes)
+            .enumerate()
+        {
+            if (width, height) != (display.width, display.height) {
+                debug!("display {id}: {width}x{height}");
+                (display.width, display.height) = (width, height);
+                changed = true;
+            }
+        }
+        if changed {
+            events_read.fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::AcqRel);
+        }
+        changed
+    }
+
+    /// The guest's cursor: a 64x64 image (the kernel's cursor size) from a
+    /// 2D or blob resource, or hidden with resource 0.
+    pub fn update_cursor(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+    ) -> VirtioGpuResult {
+        const SIZE: u32 = 64;
+        let pixels = if resource_id == 0 {
+            None
+        } else {
+            let resource = *self
+                .resources
+                .get(&resource_id)
+                .ok_or(ErrInvalidResourceId)?;
+            let row = SIZE as usize * ResourceFormat::BYTES_PER_PIXEL;
+            let mut pixels = vec![0u8; row * SIZE as usize];
+            if resource.size > 0 {
+                let base = self.rutabaga.map_ptr(resource_id).map_err(|_| ErrUnspec)? as *const u8;
+                if (row * SIZE as usize) as u64 > resource.size {
+                    return Err(ErrUnspec);
+                }
+                // SAFETY: 64 rows of 64 pixels lie within the blob, checked above.
+                pixels.copy_from_slice(unsafe { std::slice::from_raw_parts(base, row * SIZE as usize) });
+            } else {
+                Self::read_2d_resource(&mut self.rutabaga, resource, SIZE, SIZE, &mut pixels)
+                    .map_err(|_| ErrUnspec)?;
+            }
+            Some(pixels)
+        };
+        let (width, height) = if pixels.is_some() { (SIZE, SIZE) } else { (0, 0) };
+        match self
+            .display_backend
+            .update_cursor(scanout_id, hot_x, hot_y, width, height, pixels.as_deref())
+        {
+            Ok(()) | Err(DisplayBackendError::MethodNotSupported) => Ok(OkNoData),
+            Err(e) => {
+                warn!("scanout {scanout_id}: cursor: {e:?}");
+                Err(ErrUnspec)
+            }
+        }
     }
 
     pub fn display_info(&self) -> VirtioGpuResult {
@@ -1128,15 +1407,14 @@ mod test {
 
     #[test]
     fn test_read_2d_resource_larger_than_scanout() {
-        use super::{VirtioGpu, VirtioGpuResource, VirtioGpuScanout};
+        use super::{VirtioGpu, VirtioGpuResource};
         use rutabaga_gfx::{
             ResourceCreate3D, RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler,
             RutabagaIovec, Transfer3D, RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
         };
 
-        let mut rutabaga = RutabagaBuilder::new(0, RutabagaFenceHandler::new(|_| {}))
-            .set_default_component(RutabagaComponentType::Rutabaga2D)
-            .build()
+        let mut rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
             .unwrap();
         let (width, height) = (4, 2);
         rutabaga
@@ -1167,20 +1445,218 @@ mod test {
             )
             .unwrap();
         rutabaga
-            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height, 0), None)
+            .transfer_write(0, 1, Transfer3D::new_2d(0, 0, width, height))
             .unwrap();
 
         let resource = VirtioGpuResource::new(1, width, height, None, 0);
-        let scanout = VirtioGpuScanout {
-            resource_id: 1,
-            width: 2,
-            height: 2,
-        };
         let mut frame = [0u8; 2 * 2 * 4];
-        VirtioGpu::read_2d_resource(&mut rutabaga, resource, &scanout, &mut frame).unwrap();
+        VirtioGpu::read_2d_resource(&mut rutabaga, resource, 2, 2, &mut frame).unwrap();
 
         let row = |y: usize| &guest[y * 4 * 4..][..2 * 4];
         assert_eq!(frame[..2 * 4], *row(0));
         assert_eq!(frame[2 * 4..], *row(1));
+    }
+
+    #[test]
+    fn failed_set_scanout_blob_leaves_the_resource_alone() {
+        use super::{ScanoutBlob, VirtioGpu};
+        use crate::virtio::display::DisplayInfo;
+        use crate::virtio::gpu::display::NoopDisplayBackend;
+        use krun_display::IntoDisplayBackend;
+        use rutabaga_gfx::{
+            ResourceCreate3D, RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler,
+            RUTABAGA_PIPE_BIND_RENDER_TARGET, RUTABAGA_PIPE_TEXTURE_2D,
+        };
+
+        let rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
+            .unwrap();
+        // The no-op backend fails every configure_scanout.
+        let mut gpu = VirtioGpu {
+            rutabaga,
+            resources: Default::default(),
+            fence_state: Default::default(),
+            #[cfg(target_os = "macos")]
+            map_sender: crossbeam_channel::unbounded().0,
+            scanouts: Default::default(),
+            displays: Box::new([DisplayInfo::new(64, 64)]),
+            requested_sizes: Box::new([(64, 64)]),
+            display_backend: NoopDisplayBackend::into_display_backend(None)
+                .create_instance()
+                .unwrap(),
+            blob_exports: Default::default(),
+        };
+        let create = ResourceCreate3D {
+            target: RUTABAGA_PIPE_TEXTURE_2D,
+            format: 1,
+            bind: RUTABAGA_PIPE_BIND_RENDER_TARGET,
+            width: 64,
+            height: 64,
+            depth: 1,
+            array_size: 1,
+            last_level: 0,
+            nr_samples: 0,
+            flags: 0,
+        };
+        gpu.resource_create_3d(1, create).unwrap();
+        let blob = ScanoutBlob {
+            offset: 0,
+            stride: 64 * 4,
+            format: 1,
+        };
+
+        assert!(gpu.set_scanout_blob(0, 1, 64, 64, 1, blob).is_err());
+        assert!(gpu.scanouts[0].is_none());
+        // Not shown on the scanout, so the guest can free it.
+        gpu.unref_resource(1).unwrap();
+    }
+
+    /// A size the display asks for while the driver hasn't acknowledged the
+    /// last display event waits for the acknowledgement; the newest applies.
+    #[test]
+    fn display_sizes_wait_for_the_drivers_acknowledgement() {
+        use super::VirtioGpu;
+        use crate::virtio::display::DisplayInfo;
+        use crate::virtio::gpu::display::NoopDisplayBackend;
+        use crate::virtio::gpu::protocol::VIRTIO_GPU_EVENT_DISPLAY;
+        use krun_display::{DisplayFeatures, IntoDisplayBackend};
+        use libc::c_void;
+        use rutabaga_gfx::{RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler};
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::sync::Mutex;
+
+        // A display that can change size: the newest size asked for, taken
+        // once.
+        static REQUESTED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+        extern "C" fn resize_fd(_: *mut c_void) -> i32 {
+            -1
+        }
+        extern "C" fn take_display_size(
+            _: *mut c_void,
+            _display: u32,
+            width: *mut u32,
+            height: *mut u32,
+        ) -> i32 {
+            let Some((w, h)) = REQUESTED.lock().unwrap().take() else {
+                return 0;
+            };
+            // SAFETY: the device passes pointers to its own two u32s.
+            unsafe { (*width, *height) = (w, h) };
+            1
+        }
+        let mut backend = NoopDisplayBackend::into_display_backend(None);
+        backend.features |= DisplayFeatures::RESIZE.bits();
+        backend.vtable.basic_framebuffer.get_resize_efd = Some(resize_fd);
+        backend.vtable.basic_framebuffer.take_display_size = Some(take_display_size);
+
+        let rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
+            .unwrap();
+        let mut gpu = VirtioGpu {
+            rutabaga,
+            resources: Default::default(),
+            fence_state: Default::default(),
+            #[cfg(target_os = "macos")]
+            map_sender: crossbeam_channel::unbounded().0,
+            scanouts: Default::default(),
+            displays: Box::new([DisplayInfo::new(640, 480)]),
+            requested_sizes: Box::new([(640, 480)]),
+            display_backend: backend.create_instance().unwrap(),
+            blob_exports: Default::default(),
+        };
+        let events_read = AtomicU32::new(0);
+        let request = |size| *REQUESTED.lock().unwrap() = Some(size);
+        let size = |gpu: &VirtioGpu| (gpu.displays[0].width, gpu.displays[0].height);
+
+        request((800, 600));
+        assert!(gpu.take_display_sizes(&events_read));
+        assert_eq!(
+            events_read.load(Ordering::Acquire),
+            VIRTIO_GPU_EVENT_DISPLAY
+        );
+        assert_eq!(size(&gpu), (800, 600));
+
+        // The driver is still reading the display info and EDID for 800x600.
+        request((1024, 768));
+        assert!(!gpu.take_display_sizes(&events_read));
+        request((1280, 800));
+        assert!(!gpu.take_display_sizes(&events_read));
+        assert_eq!(size(&gpu), (800, 600));
+
+        // events_clear
+        events_read.fetch_and(!VIRTIO_GPU_EVENT_DISPLAY, Ordering::AcqRel);
+        assert!(gpu.take_display_sizes(&events_read));
+        assert_eq!(
+            events_read.load(Ordering::Acquire),
+            VIRTIO_GPU_EVENT_DISPLAY
+        );
+        assert_eq!(size(&gpu), (1280, 800));
+    }
+
+    /// A size with a width or height of 0 or above the guest driver's 8192
+    /// is ignored; the display keeps its size.
+    #[test]
+    fn display_sizes_outside_the_drivers_limits_are_ignored() {
+        use super::VirtioGpu;
+        use crate::virtio::display::DisplayInfo;
+        use crate::virtio::gpu::display::NoopDisplayBackend;
+        use krun_display::{DisplayFeatures, IntoDisplayBackend};
+        use libc::c_void;
+        use rutabaga_gfx::{RutabagaBuilder, RutabagaComponentType, RutabagaFenceHandler};
+        use std::sync::atomic::AtomicU32;
+        use std::sync::Mutex;
+
+        static REQUESTED: Mutex<Option<(u32, u32)>> = Mutex::new(None);
+        extern "C" fn resize_fd(_: *mut c_void) -> i32 {
+            -1
+        }
+        extern "C" fn take_display_size(
+            _: *mut c_void,
+            _display: u32,
+            width: *mut u32,
+            height: *mut u32,
+        ) -> i32 {
+            let Some((w, h)) = REQUESTED.lock().unwrap().take() else {
+                return 0;
+            };
+            // SAFETY: the device passes pointers to its own two u32s.
+            unsafe { (*width, *height) = (w, h) };
+            1
+        }
+        let mut backend = NoopDisplayBackend::into_display_backend(None);
+        backend.features |= DisplayFeatures::RESIZE.bits();
+        backend.vtable.basic_framebuffer.get_resize_efd = Some(resize_fd);
+        backend.vtable.basic_framebuffer.take_display_size = Some(take_display_size);
+
+        let rutabaga = RutabagaBuilder::new(RutabagaComponentType::Rutabaga2D, 0, 0)
+            .build(RutabagaFenceHandler::new(|_| {}), None)
+            .unwrap();
+        let mut gpu = VirtioGpu {
+            rutabaga,
+            resources: Default::default(),
+            fence_state: Default::default(),
+            #[cfg(target_os = "macos")]
+            map_sender: crossbeam_channel::unbounded().0,
+            scanouts: Default::default(),
+            displays: Box::new([DisplayInfo::new(640, 480)]),
+            requested_sizes: Box::new([(640, 480)]),
+            display_backend: backend.create_instance().unwrap(),
+            blob_exports: Default::default(),
+        };
+        let events_read = AtomicU32::new(0);
+        let request = |size| *REQUESTED.lock().unwrap() = Some(size);
+        let size = |gpu: &VirtioGpu| (gpu.displays[0].width, gpu.displays[0].height);
+
+        for bad in [(0, 768), (1366, 0), (8193, 768), (1366, 8193)] {
+            request(bad);
+            assert!(!gpu.take_display_sizes(&events_read), "{bad:?}");
+            assert_eq!(size(&gpu), (640, 480), "{bad:?}");
+        }
+        assert_eq!(events_read.into_inner(), 0);
+
+        let events_read = AtomicU32::new(0);
+        request((8192, 8192));
+        assert!(gpu.take_display_sizes(&events_read));
+        assert_eq!(size(&gpu), (8192, 8192));
     }
 }

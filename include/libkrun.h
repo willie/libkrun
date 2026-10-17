@@ -668,8 +668,8 @@ int32_t krun_set_gpu_render_server_fd(uint32_t ctx_id, int render_server_fd);
  *
  * Arguments:
  *  "ctx_id"      - the configuration context ID.
- *  "width"       - the width of the window/display
- *  "height"      - the height of the window/display
+ *  "width"       - the width of the window/display (range: 1 to 8192)
+ *  "height"      - the height of the window/display (range: 1 to 8192)
  *
  * Returns:
  *  The id of the display (0 to KRUN_MAX_DISPLAYS - 1) on success or a negative error number on failure.
@@ -733,7 +733,7 @@ int32_t krun_display_set_physical_size(uint32_t ctx_id, uint32_t display_id, uin
  * Arguments:
  *  "ctx_id"      - the configuration context ID.
  *  "display_id"  - the ID of the display (range: 0 to KRUN_MAX_DISPLAYS - 1)
- *  "refresh_rate" - refresh rate (in Hz)
+ *  "refresh_rate" - refresh rate (in Hz, range: 1 to 2325)
  *
  * Returns:
  *  Zero on success or a negative error number on failure.
