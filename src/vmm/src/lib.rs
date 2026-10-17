@@ -63,6 +63,8 @@ use kernel::cmdline::Cmdline as KernelCmdline;
 use polly::event_manager::{self, EventManager, Subscriber};
 use utils::epoll::{EpollEvent, EventSet};
 use utils::eventfd::EventFd;
+#[cfg(target_os = "macos")]
+use utils::pollable_channel::{PollableChannelReciever, PollableChannelSender};
 use vm_memory::GuestMemoryMmap;
 
 /// Success exit code.
@@ -215,6 +217,29 @@ pub struct Vmm {
     /// Whether guest RAM is mapped in blocks, see `map_guest_ram_in_blocks()`.
     #[cfg(target_os = "macos")]
     ram_in_blocks: bool,
+
+    // Out-of-band live pause/resume requests: the C API sends `VmCtl` from
+    // another thread; the event loop freezes or wakes the vCPUs. A single
+    // channel rather than one eventfd per operation, so the event loop observes
+    // the requests in the order they were made. Device worker threads are
+    // notify-driven, so a frozen guest leaves them idle without explicit
+    // handling.
+    #[cfg(target_os = "macos")]
+    vm_ctl_tx: PollableChannelSender<VmCtl>,
+    #[cfg(target_os = "macos")]
+    vm_ctl_rx: PollableChannelReciever<VmCtl>,
+    #[cfg(target_os = "macos")]
+    paused: bool,
+    #[cfg(target_os = "macos")]
+    paused_at: u64,
+}
+
+/// Out-of-band request to the running VM's event loop.
+#[cfg(target_os = "macos")]
+#[derive(Debug, Clone)]
+pub enum VmCtl {
+    Pause,
+    Resume,
 }
 
 impl Vmm {
@@ -270,6 +295,71 @@ impl Vmm {
 
     #[cfg(target_os = "macos")]
     pub fn resume_vcpus(&mut self) -> Result<()> {
+        Ok(())
+    }
+
+    /// Sender for live [`VmCtl`] requests. The event loop runs [`Vmm::pause`] /
+    /// [`Vmm::resume`] in response.
+    #[cfg(target_os = "macos")]
+    pub fn vm_ctl_sender(&self) -> PollableChannelSender<VmCtl> {
+        self.vm_ctl_tx.clone()
+    }
+
+    /// Freeze every vCPU at an instruction boundary. Reversible via [`Vmm::resume`];
+    /// the guest's virtual counter is held so timers don't fire en masse on wake.
+    /// Idempotent: pausing an already-paused VM is a no-op.
+    #[cfg(target_os = "macos")]
+    pub fn pause(&mut self) -> std::result::Result<(), String> {
+        use crate::vstate::{VcpuEvent, VcpuResponse};
+        if self.paused {
+            return Ok(());
+        }
+        for h in &self.vcpus_handles {
+            h.send_event(VcpuEvent::Pause)
+                .map_err(|e| format!("vcpu pause event: {e:?}"))?;
+            hvf::vcpu_request_exit(h.hvf_id()).map_err(|e| format!("vcpu_request_exit: {e:?}"))?;
+        }
+        for i in 0..self.vcpus_handles.len() {
+            match self.vcpus_handles[i].response_receiver().recv() {
+                Ok(VcpuResponse::Paused) => {}
+                // The vCPU stopped before it saw the request. Its exit event
+                // will find no response left to read, so stop the VM here,
+                // with the code that handler would have used.
+                Ok(VcpuResponse::Exited(exit_code)) => self.stop_guest(exit_code),
+                Ok(VcpuResponse::Reset) => {
+                    self.stop_guest(self.reset_exit_code.unwrap_or(FC_EXIT_CODE_OK))
+                }
+                Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+                Err(e) => return Err(format!("vcpu response: {e:?}")),
+            }
+        }
+        self.paused_at = unsafe { hvf::mach_absolute_time() };
+        self.paused = true;
+        Ok(())
+    }
+
+    /// Wake every vCPU previously frozen by [`Vmm::pause`], advancing the vtimer
+    /// offset by the time spent paused. Idempotent: resuming a running VM is a
+    /// no-op.
+    #[cfg(target_os = "macos")]
+    pub fn resume(&mut self) -> std::result::Result<(), String> {
+        use crate::vstate::{VcpuEvent, VcpuResponse};
+        if !self.paused {
+            return Ok(());
+        }
+        let paused_ticks = unsafe { hvf::mach_absolute_time() }.saturating_sub(self.paused_at);
+        for h in &self.vcpus_handles {
+            h.send_event(VcpuEvent::Resume(paused_ticks))
+                .map_err(|e| format!("vcpu resume event: {e:?}"))?;
+        }
+        for h in &self.vcpus_handles {
+            match h.response_receiver().recv() {
+                Ok(VcpuResponse::Resumed) => {}
+                Ok(other) => return Err(format!("unexpected vcpu response: {other:?}")),
+                Err(e) => return Err(format!("vcpu response: {e:?}")),
+            }
+        }
+        self.paused = false;
         Ok(())
     }
 
@@ -450,6 +540,20 @@ impl Subscriber for Vmm {
             return;
         }
 
+        #[cfg(target_os = "macos")]
+        if source == self.vm_ctl_rx.as_raw_fd() && event_set == EventSet::IN {
+            while let Ok(Some(req)) = self.vm_ctl_rx.try_recv() {
+                let res = match req {
+                    VmCtl::Pause => self.pause(),
+                    VmCtl::Resume => self.resume(),
+                };
+                if let Err(e) = res {
+                    error!("vm {req:?} failed: {e}");
+                }
+            }
+            return;
+        }
+
         if source == self.exit_evt.as_raw_fd() && event_set == EventSet::IN {
             let _ = self.exit_evt.read();
             // Query each vcpu for the exit_code.
@@ -480,6 +584,11 @@ impl Subscriber for Vmm {
         list.push(EpollEvent::new(
             EventSet::IN,
             self.reset_evt.as_raw_fd() as u64,
+        ));
+        #[cfg(target_os = "macos")]
+        list.push(EpollEvent::new(
+            EventSet::IN,
+            self.vm_ctl_rx.as_raw_fd() as u64,
         ));
         list
     }
