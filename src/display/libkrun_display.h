@@ -40,6 +40,23 @@ extern "C" {
 #define KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER 1
 
 /**
+ * Indicates support for the guest's cursor: the implementation must provide `update_cursor`.
+ */
+#define KRUN_DISPLAY_FEATURE_CURSOR 2
+
+/**
+ * Indicates the display can change size while the VM runs: the implementation must provide
+ * `get_resize_efd` and `take_display_size`.
+ */
+#define KRUN_DISPLAY_FEATURE_RESIZE 4
+/**
+ * The backend shows blob scanouts straight from the blob's memory: libkrun
+ * hands it the blob's descriptor and layout with present_blob instead of
+ * copying rows into a frame from alloc_frame.
+ */
+#define KRUN_DISPLAY_FEATURE_BLOB_SCANOUT 8
+
+/**
  * Called to create a display instance.
  *
  * Arguments:
@@ -146,6 +163,78 @@ struct krun_rect {
 typedef int32_t (*krun_display_present_frame_fn)(void *instance, uint32_t scanout_id, uint32_t frame_id, const struct krun_rect* damage_area);
 
 /**
+ * The guest's cursor image on a scanout changed.
+ *
+ * Arguments:
+ *  "instance"    - userdata set by `krun_display_create`, represents this/self argument
+ *  "scanout_id"  - The scanout the cursor is on.
+ *  "hot_x", "hot_y" - The cursor's hot spot, in pixels from its top left.
+ *  "width", "height" - The size of `pixels`; zero when the guest hides the cursor.
+ *  "pixels"      - `width` x `height` B8G8R8A8 pixels, rows tightly packed; NULL when hidden.
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_update_cursor_fn)(void *instance,
+    uint32_t scanout_id,
+    uint32_t hot_x,
+    uint32_t hot_y,
+    uint32_t width,
+    uint32_t height,
+    const uint8_t *pixels);
+
+/**
+ * Returns a file descriptor that becomes readable when a display's size should change; the GPU
+ * device then calls `take_display_size` for each display. Reading the descriptor is left to the
+ * implementation (in `take_display_size`).
+ */
+typedef int (*krun_display_get_resize_efd_fn)(void *instance);
+
+/**
+ * Presents a blob scanout from the blob's own memory (KRUN_DISPLAY_FEATURE_BLOB_SCANOUT).
+ *
+ * Arguments:
+ *  "resource_id"  - the blob; the same id means the same memory until release_blob
+ *  "fd"           - a descriptor of the blob's memory, valid during this call (the
+ *                   backend dups it to keep it); the same for every call with this
+ *                   resource_id
+ *  "offset"       - where the scanout's first row starts in the blob
+ *  "stride"       - bytes between rows
+ *  "width", "height", "format" - the scanout, as configure_scanout had them
+ *  "size"         - the blob's size in bytes
+ *  "damage_area"  - (Optional) the area that changed since the last present
+ *
+ * Returns:
+ *  Zero on success or a negative error code (KRUN_DISPLAY_ERR_*) otherwise.
+ */
+typedef int32_t (*krun_display_present_blob_fn)(void *instance,
+    uint32_t scanout_id,
+    uint32_t resource_id,
+    int fd,
+    uint64_t offset,
+    uint32_t stride,
+    uint32_t width,
+    uint32_t height,
+    uint32_t format,
+    uint64_t size,
+    const struct krun_rect *damage_area);
+
+/**
+ * The guest destroyed a blob that was presented with present_blob: the
+ * backend drops what it kept for resource_id.
+ */
+typedef int32_t (*krun_display_release_blob_fn)(void *instance, uint32_t resource_id);
+
+/**
+ * Takes a pending size for a display, if there is one.
+ *
+ * Returns:
+ *  1 with "width" and "height" set if the display should change to that size, 0 if not, or a
+ *  negative error code (KRUN_DISPLAY_ERR_*).
+ */
+typedef int32_t (*krun_display_take_display_size_fn)(void *instance, uint32_t display_id, uint32_t *width, uint32_t *height);
+
+/**
  * Defines the set of callbacks for a display implementation.
  * This structure holds function pointers that a display backend implements to integrate with the libkrun.
  *
@@ -168,6 +257,11 @@ struct krun_display_basic_framebuffer_vtable {
     krun_display_configure_scanout_fn   configure_scanout; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_alloc_frame_fn         alloc_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
     krun_display_present_frame_fn       present_frame; // Required by KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER
+    krun_display_update_cursor_fn       update_cursor; // Required by KRUN_DISPLAY_FEATURE_CURSOR
+    krun_display_get_resize_efd_fn      get_resize_efd; // Required by KRUN_DISPLAY_FEATURE_RESIZE
+    krun_display_take_display_size_fn   take_display_size; // Required by KRUN_DISPLAY_FEATURE_RESIZE
+    krun_display_present_blob_fn        present_blob; // Required by KRUN_DISPLAY_FEATURE_BLOB_SCANOUT
+    krun_display_release_blob_fn        release_blob; // Required by KRUN_DISPLAY_FEATURE_BLOB_SCANOUT
 };
 
 union krun_display_vtable {
