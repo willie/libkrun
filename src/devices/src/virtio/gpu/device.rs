@@ -1,8 +1,11 @@
 use std::io::Write;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
+use utils::eventfd::{EventFd, EFD_NONBLOCK};
 use vm_memory::{ByteValued, GuestMemoryMmap};
 
 use super::super::{
@@ -12,6 +15,7 @@ use super::super::{
 use super::defs;
 use super::defs::uapi;
 use super::defs::uapi::virtio_gpu_config;
+use super::protocol::VIRTIO_GPU_EVENT_DISPLAY;
 use super::worker::Worker;
 use crate::virtio::display::DisplayInfo;
 use crate::virtio::InterruptTransport;
@@ -45,6 +49,11 @@ pub struct Gpu {
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
+    /// VIRTIO_GPU_EVENT_* pending for the driver (config `events_read`).
+    events_read: Arc<AtomicU32>,
+    /// Written when the driver acknowledges a display event, for the worker,
+    /// which holds new display sizes until then.
+    display_ack: EventFd,
 }
 
 impl Gpu {
@@ -70,6 +79,8 @@ impl Gpu {
             // Blobs are mapped into the guest in host pages, which can be
             // larger than the guest's (16 KiB on Apple silicon).
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            events_read: Arc::new(AtomicU32::new(0)),
+            display_ack: EventFd::new(EFD_NONBLOCK).map_err(super::GpuError::EventFd)?,
         })
     }
 
@@ -169,7 +180,7 @@ impl VirtioDevice for Gpu {
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
-            events_read: 0,
+            events_read: self.events_read.load(Ordering::Acquire),
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             num_capsets: 5,
@@ -190,6 +201,17 @@ impl VirtioDevice for Gpu {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // events_clear: the driver acknowledges events.
+        if offset == 4 && data.len() == 4 {
+            let clear = u32::from_le_bytes(data.try_into().unwrap());
+            let pending = self.events_read.fetch_and(!clear, Ordering::AcqRel);
+            if pending & clear & VIRTIO_GPU_EVENT_DISPLAY != 0 {
+                if let Err(e) = self.display_ack.write(1) {
+                    error!("gpu: failed to signal the display event acknowledgement: {e:?}");
+                }
+            }
+            return;
+        }
         warn!(
             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,
@@ -203,7 +225,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -216,9 +238,11 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
-        // cursor queue not used by worker
         let worker = Worker::new(
             control_q,
+            cursor_q,
+            self.events_read.clone(),
+            self.display_ack.try_clone().unwrap(),
             mem.clone(),
             interrupt.clone(),
             shm_region,
@@ -250,13 +274,14 @@ impl VirtioDevice for Gpu {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::display::NoopDisplayBackend;
+    use crate::virtio::gpu::display::NoopDisplayBackend;
     use krun_display::IntoDisplayBackend;
 
     #[test]
     fn blob_alignment_offered() {
         let gpu = Gpu::new(
             0,
+            None,
             Box::new([]),
             NoopDisplayBackend::into_display_backend(None),
             #[cfg(target_os = "macos")]
@@ -271,5 +296,32 @@ mod tests {
         gpu.read_config(16, &mut data);
         let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32;
         assert_eq!(u32::from_le_bytes(data), page_size);
+    }
+
+    #[test]
+    fn display_event_acknowledgement_wakes_the_worker() {
+        let mut gpu = Gpu::new(
+            0,
+            None,
+            Box::new([]),
+            NoopDisplayBackend::into_display_backend(None),
+            #[cfg(target_os = "macos")]
+            crossbeam_channel::unbounded().0,
+        )
+        .unwrap();
+        let worker_ack = gpu.display_ack.try_clone().unwrap();
+        let clear = |gpu: &mut Gpu, events: u32| gpu.write_config(4, &events.to_le_bytes());
+
+        // Nothing to acknowledge: no wake-up.
+        clear(&mut gpu, VIRTIO_GPU_EVENT_DISPLAY);
+        assert!(worker_ack.read().is_err());
+
+        gpu.events_read.fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::AcqRel);
+        clear(&mut gpu, VIRTIO_GPU_EVENT_DISPLAY);
+        let mut data = [0u8; 4];
+        gpu.read_config(0, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 0);
+        worker_ack.read().unwrap();
+        assert!(worker_ack.read().is_err());
     }
 }
