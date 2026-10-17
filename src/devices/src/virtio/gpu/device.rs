@@ -27,7 +27,8 @@ pub(crate) const AVAIL_FEATURES: u64 = (1u64 << uapi::VIRTIO_F_VERSION_1)
     | (1u64 << uapi::VIRTIO_GPU_F_EDID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_UUID)
     | (1u64 << uapi::VIRTIO_GPU_F_RESOURCE_BLOB)
-    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT);
+    | (1u64 << uapi::VIRTIO_GPU_F_CONTEXT_INIT)
+    | (1u64 << uapi::VIRTIO_GPU_F_BLOB_ALIGNMENT);
 
 const QUEUE_SIZE: u16 = 256;
 static QUEUE_CONFIG: [QueueConfig; defs::NUM_QUEUES] =
@@ -47,6 +48,7 @@ pub struct Gpu {
     display_backend: DisplayBackend<'static>,
     /// VIRTIO_GPU_EVENT_* pending for the driver (config `events_read`).
     events_read: Arc<AtomicU32>,
+    blob_alignment: u32,
 }
 
 impl Gpu {
@@ -70,6 +72,9 @@ impl Gpu {
             displays,
             display_backend,
             events_read: Arc::new(AtomicU32::new(0)),
+            // Blobs are mapped into the guest in host pages, which can be
+            // larger than the guest's (16 KiB on Apple silicon).
+            blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
         })
     }
 
@@ -173,6 +178,7 @@ impl VirtioDevice for Gpu {
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             num_capsets: 5,
+            blob_alignment: self.blob_alignment,
         };
 
         let config_slice = config.as_slice();
