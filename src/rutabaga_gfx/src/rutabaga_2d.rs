@@ -141,31 +141,19 @@ fn transfer_2d(
     Ok(())
 }
 
-pub struct Rutabaga2D {
-    fence_handler: RutabagaFenceHandler,
-}
-
-impl Rutabaga2D {
-    pub fn init(fence_handler: RutabagaFenceHandler) -> RutabagaResult<Box<dyn RutabagaComponent>> {
-        Ok(Box::new(Rutabaga2D { fence_handler }))
-    }
-}
-
-impl RutabagaComponent for Rutabaga2D {
-    fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
-        self.fence_handler.call(fence);
-        Ok(())
-    }
-
-    fn create_3d(
-        &self,
+impl RutabagaResource {
+    pub fn new_2d(
         resource_id: u32,
         resource_create_3d: ResourceCreate3D,
+        component_type: RutabagaComponentType,
     ) -> RutabagaResult<RutabagaResource> {
         // All virtio formats are 4 bytes per pixel.
         let resource_bpp = 4;
-        let resource_stride = resource_bpp * resource_create_3d.width;
-        let resource_size = (resource_stride as usize) * (resource_create_3d.height as usize);
+        let resource_size = resource_create_3d
+            .width
+            .checked_mul(resource_bpp)
+            .and_then(|stride| stride.checked_mul(resource_create_3d.height))
+            .ok_or(RutabagaError::Invalid2DInfo)? as usize;
         let info_2d = Rutabaga2DInfo {
             width: resource_create_3d.width,
             height: resource_create_3d.height,
@@ -185,28 +173,23 @@ impl RutabagaComponent for Rutabaga2D {
             info_3d: None,
             vulkan_info: None,
             backing_iovecs: None,
-            component_mask: 1 << (RutabagaComponentType::Rutabaga2D as u8),
+            component_mask: 1 << (component_type as u8),
             size: resource_size as u64,
             mapping: None,
         })
     }
 
-    fn transfer_write(
-        &self,
-        _ctx_id: u32,
-        resource: &mut RutabagaResource,
-        transfer: Transfer3D,
-    ) -> RutabagaResult<()> {
+    pub fn transfer_write_2d(&mut self, transfer: Transfer3D) -> RutabagaResult<()> {
         if transfer.is_empty() {
             return Ok(());
         }
 
-        let mut info_2d = resource
+        let mut info_2d = self
             .info_2d
             .take()
             .ok_or(RutabagaError::Invalid2DInfo)?;
 
-        let iovecs = resource
+        let iovecs = self
             .backing_iovecs
             .take()
             .ok_or(RutabagaError::InvalidIovec)?;
@@ -241,19 +224,17 @@ impl RutabagaComponent for Rutabaga2D {
             &src_slices,
         )?;
 
-        resource.info_2d = Some(info_2d);
-        resource.backing_iovecs = Some(iovecs);
+        self.info_2d = Some(info_2d);
+        self.backing_iovecs = Some(iovecs);
         Ok(())
     }
 
-    fn transfer_read(
-        &self,
-        _ctx_id: u32,
-        resource: &mut RutabagaResource,
+    pub fn transfer_read_2d(
+        &mut self,
         transfer: Transfer3D,
         buf: Option<IoSliceMut>,
     ) -> RutabagaResult<()> {
-        let mut info_2d = resource
+        let mut info_2d = self
             .info_2d
             .take()
             .ok_or(RutabagaError::Invalid2DInfo)?;
@@ -283,7 +264,55 @@ impl RutabagaComponent for Rutabaga2D {
             &[info_2d.host_mem.as_mut_slice()],
         )?;
 
-        resource.info_2d = Some(info_2d);
+        self.info_2d = Some(info_2d);
         Ok(())
+    }
+}
+
+pub struct Rutabaga2D {
+    fence_handler: RutabagaFenceHandler,
+}
+
+impl Rutabaga2D {
+    pub fn init(fence_handler: RutabagaFenceHandler) -> RutabagaResult<Box<dyn RutabagaComponent>> {
+        Ok(Box::new(Rutabaga2D { fence_handler }))
+    }
+}
+
+impl RutabagaComponent for Rutabaga2D {
+    fn create_fence(&mut self, fence: RutabagaFence) -> RutabagaResult<()> {
+        self.fence_handler.call(fence);
+        Ok(())
+    }
+
+    fn create_3d(
+        &self,
+        resource_id: u32,
+        resource_create_3d: ResourceCreate3D,
+    ) -> RutabagaResult<RutabagaResource> {
+        RutabagaResource::new_2d(
+            resource_id,
+            resource_create_3d,
+            RutabagaComponentType::Rutabaga2D,
+        )
+    }
+
+    fn transfer_write(
+        &self,
+        _ctx_id: u32,
+        resource: &mut RutabagaResource,
+        transfer: Transfer3D,
+    ) -> RutabagaResult<()> {
+        resource.transfer_write_2d(transfer)
+    }
+
+    fn transfer_read(
+        &self,
+        _ctx_id: u32,
+        resource: &mut RutabagaResource,
+        transfer: Transfer3D,
+        buf: Option<IoSliceMut>,
+    ) -> RutabagaResult<()> {
+        resource.transfer_read_2d(transfer, buf)
     }
 }

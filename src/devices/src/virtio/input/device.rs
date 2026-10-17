@@ -78,7 +78,7 @@ impl InputConfig {
             }
             config_select::VIRTIO_INPUT_CFG_ABS_INFO => cfg
                 .query_abs_info(subsel, unsafe { &mut self.repr.payload.abs })
-                .map(|_| size_of::<InputDeviceIds>() as u8),
+                .map(|_| size_of::<InputAbsInfo>() as u8),
             select => {
                 error!("Invalid config selection select = {select}");
                 self.invalidate();
@@ -92,9 +92,14 @@ impl InputConfig {
                 self.repr.select = select;
                 self.repr.subsel = subsel;
             }
+            // The driver writes select and subsel separately, so the first
+            // write can pair the new select with an old subsel: keep both, so
+            // the subsel write that follows queries the right thing.
             Err(e) => {
-                error!("Failed to query config select={select}, subsel={subsel}: {e:?}");
-                self.invalidate();
+                debug!("Failed to query config select={select}, subsel={subsel}: {e:?}");
+                self.repr.size = 0;
+                self.repr.select = select;
+                self.repr.subsel = subsel;
             }
         };
     }

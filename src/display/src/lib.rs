@@ -20,6 +20,9 @@ mod header {
 bitflags! {
     pub struct DisplayFeatures: u64 {
         const BASIC_FRAMEBUFFER = header::KRUN_DISPLAY_FEATURE_BASIC_FRAMEBUFFER as u64;
+        const CURSOR = header::KRUN_DISPLAY_FEATURE_CURSOR as u64;
+        const RESIZE = header::KRUN_DISPLAY_FEATURE_RESIZE as u64;
+        const BLOB_SCANOUT = header::KRUN_DISPLAY_FEATURE_BLOB_SCANOUT as u64;
     }
 }
 

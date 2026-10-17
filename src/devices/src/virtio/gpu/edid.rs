@@ -78,23 +78,40 @@ impl EdidInfo {
         (self.height_millimeters / 10) as u8
     }
 
+    /// The pixel clock in 10 kHz units.
+    fn clock(&self) -> u32 {
+        let htotal = self.width + u32::from(self.horizontal_blanking);
+        let vtotal = self.height + u32::from(self.vertical_blanking);
+        self.refresh_rate * htotal * vtotal / 10000
+    }
+
     pub fn bytes(self) -> Box<[u8]> {
-        let mut edid_box: Box<[u8]> = vec![0; EDID_DATA_LENGTH].into_boxed_slice();
-        let edid = &mut edid_box[..];
+        let mut edid_box: Box<[u8]> = vec![0; 2 * EDID_DATA_LENGTH].into_boxed_slice();
+        let (edid, extension) = edid_box.split_at_mut(EDID_DATA_LENGTH);
 
         populate_header(edid);
         populate_edid_version(edid);
         populate_size(edid, &self);
         populate_standard_timings(edid, &self);
 
-        // 4 available descriptor blocks
+        // 4 available descriptor blocks. A detailed timing holds 12-bit
+        // sizes and a 16-bit clock; a larger mode is only in the DisplayID
+        // extension, and the descriptor is left as a dummy.
         let block0 = &mut edid[54..72];
-        populate_detailed_timing(block0, &self);
+        if self.width < 4096 && self.height < 4096 && self.clock() <= u32::from(u16::MAX) {
+            populate_detailed_timing(block0, &self);
+        } else {
+            block0[3] = 0x10;
+        }
 
         let block1 = &mut edid[72..90];
         populate_display_name(block1);
 
+        edid[126] = 1;
         calculate_checksum(edid);
+
+        populate_displayid(extension, &self);
+        calculate_checksum(extension);
 
         edid_box
     }
@@ -207,6 +224,46 @@ fn populate_detailed_timing(edid_block: &mut [u8], info: &EdidInfo) {
     edid_block[12] = width_millimeters_lsb;
     edid_block[13] = height_millimeters_lsb;
     edid_block[14] = height_millimeters_msb | (width_millimeters_msb << 4);
+}
+
+// A DisplayID 1.3 extension block with the mode as its one, preferred, Type I
+// detailed timing: 16-bit sizes and a 24-bit clock, for modes a detailed
+// timing in the base block can't hold. Every field is stored minus one.
+fn populate_displayid(extension: &mut [u8], info: &EdidInfo) {
+    const TIMING_LENGTH: u8 = 20;
+    const BLOCK_LENGTH: u8 = 3 + TIMING_LENGTH;
+
+    extension[0] = 0x70; // DisplayID extension
+    let section = &mut extension[1..];
+    section[0] = 0x13; // version 1.3
+    section[1] = BLOCK_LENGTH;
+    section[2] = 0x00; // extension section
+    section[3] = 0; // no further sections
+
+    let block = &mut section[4..4 + usize::from(BLOCK_LENGTH)];
+    block[0] = 0x03; // Type I detailed timing
+    block[1] = 0x00;
+    block[2] = TIMING_LENGTH;
+    let timing = &mut block[3..];
+    timing[0..3].copy_from_slice(&(info.clock() - 1).to_le_bytes()[..3]);
+    timing[3] = 0x80; // preferred
+    let fields = [
+        info.width,
+        u32::from(info.horizontal_blanking),
+        u32::from(info.horizontal_front),
+        u32::from(info.horizontal_sync),
+        info.height,
+        u32::from(info.vertical_blanking),
+        u32::from(info.vertical_front),
+        u32::from(info.vertical_sync),
+    ];
+    for (i, field) in fields.into_iter().enumerate() {
+        timing[4 + 2 * i..6 + 2 * i].copy_from_slice(&((field - 1) as u16).to_le_bytes());
+    }
+
+    let end = 4 + usize::from(BLOCK_LENGTH);
+    let sum = section[..end].iter().fold(0u8, |sum, byte| sum.wrapping_add(*byte));
+    section[end] = sum.wrapping_neg();
 }
 
 // The EDID header. This is defined by the EDID spec.

@@ -130,6 +130,63 @@ impl DisplayBackendBasicFramebuffer for DisplayBackendInstance {
             }
         }
     }
+
+    fn update_cursor(
+        &mut self,
+        scanout_id: u32,
+        hot_x: u32,
+        hot_y: u32,
+        width: u32,
+        height: u32,
+        pixels: Option<&[u8]>,
+    ) -> Result<(), DisplayBackendError> {
+        into_rust_result! {
+            method_call!{
+                self.update_cursor(scanout_id, hot_x, hot_y, width, height, pixels.map_or(null(), <[u8]>::as_ptr))
+            }
+        }
+    }
+
+    fn resize_fd(&self) -> Option<i32> {
+        let get_resize_efd = self.vtable.get_resize_efd?;
+        // SAFETY: calling the implementation's method with its instance.
+        let fd = unsafe { get_resize_efd(self.instance) };
+        (fd >= 0).then_some(fd)
+    }
+
+    fn take_display_size(&mut self, display_id: u32) -> Result<Option<(u32, u32)>, DisplayBackendError> {
+        let (mut width, mut height) = (0u32, 0u32);
+        into_rust_result! {
+            method_call!{
+                self.take_display_size(display_id, &raw mut width, &raw mut height)
+            },
+            0 => Ok(None),
+            1 => Ok(Some((width, height)))
+        }
+    }
+
+    fn present_blob(
+        &mut self,
+        scanout_id: u32,
+        resource_id: u32,
+        fd: i32,
+        offset: u64,
+        stride: u32,
+        width: u32,
+        height: u32,
+        format: u32,
+        size: u64,
+        rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        let rect_ptr = rect.map_or(null(), |r| r as *const Rect);
+        into_rust_result!(method_call! {
+            self.present_blob(scanout_id, resource_id, fd, offset, stride, width, height, format, size, rect_ptr)
+        })
+    }
+
+    fn release_blob(&mut self, resource_id: u32) -> Result<(), DisplayBackendError> {
+        into_rust_result!(method_call! { self.release_blob(resource_id) })
+    }
 }
 
 #[derive(Copy, Clone)]
@@ -154,11 +211,22 @@ impl DisplayBackend<'_> {
         }
         assert!(self.verify());
 
-        Ok(DisplayBackendInstance {
-            instance,
-            // SAFETY: we have checked the feature flags, so basic_framebuffer should be populated
-            vtable: unsafe { self.vtable.basic_framebuffer },
-        })
+        // SAFETY: we have checked the feature flags, so basic_framebuffer should be populated
+        let mut vtable = unsafe { self.vtable.basic_framebuffer };
+        // Methods of features the implementation didn't declare are unset.
+        let features = DisplayFeatures::from_bits_retain(self.features);
+        if !features.contains(DisplayFeatures::CURSOR) {
+            vtable.update_cursor = None;
+        }
+        if !features.contains(DisplayFeatures::RESIZE) {
+            vtable.get_resize_efd = None;
+            vtable.take_display_size = None;
+        }
+        if !features.contains(DisplayFeatures::BLOB_SCANOUT) {
+            vtable.present_blob = None;
+            vtable.release_blob = None;
+        }
+        Ok(DisplayBackendInstance { instance, vtable })
     }
 
     pub fn verify(&self) -> bool {
@@ -181,6 +249,30 @@ impl DisplayBackend<'_> {
                         || self.vtable.basic_framebuffer.present_frame.is_none()
                 } {
                     error!("Missing required methods for BASIC_FRAMEBUFFER");
+                    return false;
+                }
+            } else if feature.contains(DisplayFeatures::CURSOR) {
+                // SAFETY: as above.
+                if unsafe { self.vtable.basic_framebuffer.update_cursor.is_none() } {
+                    error!("Missing required methods for CURSOR");
+                    return false;
+                }
+            } else if feature.contains(DisplayFeatures::RESIZE) {
+                // SAFETY: as above.
+                if unsafe {
+                    self.vtable.basic_framebuffer.get_resize_efd.is_none()
+                        || self.vtable.basic_framebuffer.take_display_size.is_none()
+                } {
+                    error!("Missing required methods for RESIZE");
+                    return false;
+                }
+            } else if feature.contains(DisplayFeatures::BLOB_SCANOUT) {
+                // SAFETY: as above.
+                if unsafe {
+                    self.vtable.basic_framebuffer.present_blob.is_none()
+                        || self.vtable.basic_framebuffer.release_blob.is_none()
+                } {
+                    error!("Missing required methods for BLOB_SCANOUT");
                     return false;
                 }
             } else {

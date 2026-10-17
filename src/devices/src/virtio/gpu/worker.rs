@@ -1,9 +1,11 @@
 use std::io::Read;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 
 use nix::fcntl::{fcntl, FcntlArg, OFlag};
+use utils::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use utils::eventfd::EventFd;
 
 #[cfg(target_os = "macos")]
@@ -21,16 +23,21 @@ use super::super::{DeviceQueue, GpuError, Queue as VirtQueue};
 use super::protocol::{
     virtio_gpu_ctrl_hdr, virtio_gpu_mem_entry, GpuCommand, GpuResponse, VirtioGpuResult,
 };
-use super::virtio_gpu::VirtioGpu;
+use super::virtio_gpu::{ScanoutBlob, VirtioGpu};
 use crate::virtio::display::DisplayInfo;
 use crate::virtio::fs::ExportTable;
-use crate::virtio::gpu::protocol::{VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX};
+use crate::virtio::gpu::protocol::{
+    VIRTIO_GPU_EVENT_DISPLAY, VIRTIO_GPU_FLAG_FENCE, VIRTIO_GPU_FLAG_INFO_RING_IDX,
+};
 use crate::virtio::gpu::virtio_gpu::VirtioGpuRing;
 use crate::virtio::{InterruptTransport, VirtioShmRegion};
-use krun_display::DisplayBackend;
+use krun_display::{DisplayBackend, ResourceFormat};
 use krun_display::Rect;
 
 pub struct Worker {
+    cursor_evt: EventFd,
+    cursor_queue: Arc<Mutex<VirtQueue>>,
+    events_read: Arc<AtomicU32>,
     control_evt: EventFd,
     control_queue: Arc<Mutex<VirtQueue>>,
     mem: GuestMemoryMmap,
@@ -49,6 +56,8 @@ impl Worker {
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         control_q: DeviceQueue,
+        cursor_q: DeviceQueue,
+        events_read: Arc<AtomicU32>,
         mem: GuestMemoryMmap,
         interrupt: InterruptTransport,
         shm_region: VirtioShmRegion,
@@ -68,6 +77,9 @@ impl Worker {
         fcntl(fd, FcntlArg::F_SETFL(flags)).unwrap();
 
         Self {
+            cursor_evt: cursor_q.event.try_clone().unwrap(),
+            cursor_queue: Arc::new(Mutex::new(cursor_q.queue)),
+            events_read,
             control_evt,
             control_queue: Arc::new(Mutex::new(control_q.queue)),
             mem,
@@ -104,14 +116,57 @@ impl Worker {
             self.display_backend,
         );
 
+        const CONTROL: u64 = 0;
+        const CURSOR: u64 = 1;
+        const RESIZE: u64 = 2;
+        let epoll = Epoll::new().expect("gpu worker epoll");
+        let watch = |fd: i32, token: u64| {
+            epoll
+                .ctl(ControlOperation::Add, fd, &EpollEvent::new(EventSet::IN, token))
+                .expect("gpu worker epoll add")
+        };
+        watch(self.control_evt.as_raw_fd(), CONTROL);
+        watch(self.cursor_evt.as_raw_fd(), CURSOR);
+        if let Some(fd) = virtio_gpu.display_resize_fd() {
+            watch(fd, RESIZE);
+        }
+
+        let mut events = vec![EpollEvent::default(); 4];
         loop {
-            if let Err(e) = self.control_evt.read() {
-                error!("Failed to read control_evt: {e:?}");
-                continue;
-            }
-            if self.process_queue(&mut virtio_gpu, &self.control_queue.clone()) {
-                if let Err(e) = self.interrupt.try_signal_used_queue() {
-                    error!("Error signaling queue: {e:?}");
+            let count = match epoll.wait(events.len(), -1, &mut events) {
+                Ok(count) => count,
+                Err(e) => {
+                    error!("gpu worker epoll wait: {e:?}");
+                    continue;
+                }
+            };
+            for event in &events[..count] {
+                let queue = match event.data() {
+                    CONTROL => {
+                        if let Err(e) = self.control_evt.read() {
+                            error!("Failed to read control_evt: {e:?}");
+                        }
+                        self.control_queue.clone()
+                    }
+                    CURSOR => {
+                        let _ = self.cursor_evt.read();
+                        self.cursor_queue.clone()
+                    }
+                    _ => {
+                        // The display changed size: tell the driver, which reads
+                        // the display info and EDID again.
+                        if virtio_gpu.take_display_sizes() {
+                            self.events_read
+                                .fetch_or(VIRTIO_GPU_EVENT_DISPLAY, Ordering::AcqRel);
+                            self.interrupt.signal_config_change();
+                        }
+                        continue;
+                    }
+                };
+                if self.process_queue(&mut virtio_gpu, &queue) {
+                    if let Err(e) = self.interrupt.try_signal_used_queue() {
+                        error!("Error signaling queue: {e:?}");
+                    }
                 }
             }
         }
@@ -191,12 +246,14 @@ impl Worker {
                 }
             }
             GpuCommand::ResourceDetachBacking(info) => virtio_gpu.detach_backing(info.resource_id),
-            GpuCommand::UpdateCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand:UpdateCursor unimplemented");
-            }
-            GpuCommand::MoveCursor(_info) => {
-                panic!("virtio_gpu: GpuCommand::MoveCursor unimplemented");
-            }
+            GpuCommand::UpdateCursor(info) => virtio_gpu.update_cursor(
+                info.pos.scanout_id,
+                info.resource_id,
+                info.hot_x,
+                info.hot_y,
+            ),
+            // The host's pointer is where the absolute pointer device put it.
+            GpuCommand::MoveCursor(_info) => Ok(GpuResponse::OkNoData),
             GpuCommand::ResourceAssignUuid(info) => {
                 let resource_id = info.resource_id;
                 virtio_gpu.resource_assign_uuid(resource_id)
@@ -335,8 +392,22 @@ impl Worker {
                     mem,
                 )
             }
-            GpuCommand::SetScanoutBlob(_info) => {
-                panic!("virtio_gpu: GpuCommand::SetScanoutBlob unimplemented");
+            GpuCommand::SetScanoutBlob(info) => {
+                let blob = ScanoutBlob {
+                    offset: u64::from(info.offsets[0])
+                        + u64::from(info.r.y) * u64::from(info.strides[0])
+                        + u64::from(info.r.x) * ResourceFormat::BYTES_PER_PIXEL as u64,
+                    stride: info.strides[0],
+                    format: info.format,
+                };
+                virtio_gpu.set_scanout_blob(
+                    info.scanout_id,
+                    info.resource_id,
+                    info.r.width,
+                    info.r.height,
+                    info.format,
+                    blob,
+                )
             }
             GpuCommand::ResourceMapBlob(info) => {
                 let resource_id = info.resource_id;
