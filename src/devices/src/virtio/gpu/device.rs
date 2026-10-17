@@ -1,5 +1,7 @@
 use std::io::Write;
 use std::os::fd::RawFd;
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::Arc;
 
 #[cfg(target_os = "macos")]
 use crossbeam_channel::Sender;
@@ -45,6 +47,8 @@ pub struct Gpu {
     displays: Box<[DisplayInfo]>,
     display_backend: DisplayBackend<'static>,
     blob_alignment: u32,
+    /// VIRTIO_GPU_EVENT_* pending for the driver (config `events_read`).
+    events_read: Arc<AtomicU32>,
 }
 
 impl Gpu {
@@ -70,6 +74,7 @@ impl Gpu {
             // Blobs are mapped into the guest in host pages, which can be
             // larger than the guest's (16 KiB on Apple silicon).
             blob_alignment: unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as u32,
+            events_read: Arc::new(AtomicU32::new(0)),
         })
     }
 
@@ -169,7 +174,7 @@ impl VirtioDevice for Gpu {
 
     fn read_config(&self, offset: u64, mut data: &mut [u8]) {
         let config = virtio_gpu_config {
-            events_read: 0,
+            events_read: self.events_read.load(Ordering::Acquire),
             events_clear: 0,
             num_scanouts: self.displays.len() as u32,
             num_capsets: 5,
@@ -190,6 +195,12 @@ impl VirtioDevice for Gpu {
     }
 
     fn write_config(&mut self, offset: u64, data: &[u8]) {
+        // events_clear: the driver acknowledges events.
+        if offset == 4 && data.len() == 4 {
+            let clear = u32::from_le_bytes(data.try_into().unwrap());
+            self.events_read.fetch_and(!clear, Ordering::AcqRel);
+            return;
+        }
         warn!(
             "gpu: guest driver attempted to write device config (offset={:x}, len={:x})",
             offset,
@@ -203,7 +214,7 @@ impl VirtioDevice for Gpu {
         interrupt: InterruptTransport,
         queues: Vec<DeviceQueue>,
     ) -> ActivateResult {
-        let [control_q, _cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
+        let [control_q, cursor_q]: [_; defs::NUM_QUEUES] = queues.try_into().map_err(|_| {
             error!(
                 "Cannot perform activate. Expected {} queue(s)",
                 defs::NUM_QUEUES
@@ -216,9 +227,10 @@ impl VirtioDevice for Gpu {
             None => panic!("virtio_gpu: missing SHM region"),
         };
 
-        // cursor queue not used by worker
         let worker = Worker::new(
             control_q,
+            cursor_q,
+            self.events_read.clone(),
             mem.clone(),
             interrupt.clone(),
             shm_region,
