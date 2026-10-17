@@ -33,6 +33,55 @@ pub trait DisplayBackendBasicFramebuffer {
         frame_id: u32,
         rect: Option<&Rect>,
     ) -> Result<(), DisplayBackendError>;
+
+    /// The guest's cursor changed: `width` x `height` BGRA pixels with the
+    /// hot spot at (`hot_x`, `hot_y`), or `None` when it is hidden.
+    fn update_cursor(
+        &mut self,
+        _scanout_id: u32,
+        _hot_x: u32,
+        _hot_y: u32,
+        _width: u32,
+        _height: u32,
+        _pixels: Option<&[u8]>,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// A descriptor that becomes readable when a display should change size.
+    fn resize_fd(&self) -> Option<i32> {
+        None
+    }
+
+    /// The size display `display_id` should change to, if one is pending.
+    fn take_display_size(&mut self, _display_id: u32) -> Result<Option<(u32, u32)>, DisplayBackendError> {
+        Ok(None)
+    }
+
+    /// Shows a blob scanout from the blob's memory: `fd` (valid for this call)
+    /// is the blob of `size` bytes, the scanout's rows start at `offset`,
+    /// `stride` bytes apart. `MethodNotSupported` means copy instead.
+    #[allow(clippy::too_many_arguments)]
+    fn present_blob(
+        &mut self,
+        _scanout_id: u32,
+        _resource_id: u32,
+        _fd: i32,
+        _offset: u64,
+        _stride: u32,
+        _width: u32,
+        _height: u32,
+        _format: u32,
+        _size: u64,
+        _rect: Option<&Rect>,
+    ) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
+
+    /// The blob `resource_id` of earlier `present_blob` calls is gone.
+    fn release_blob(&mut self, _resource_id: u32) -> Result<(), DisplayBackendError> {
+        Err(DisplayBackendError::MethodNotSupported)
+    }
 }
 
 pub trait IntoDisplayBackend<T: Sync> {
@@ -144,6 +193,11 @@ impl<T: Sync, I: DisplayBackendBasicFramebuffer + DisplayBackendNew<T>> IntoDisp
                     present_frame: Some(present_frame::<I>),
                     alloc_frame: Some(alloc_frame::<I>),
                     disable_scanout: Some(disable_scanout_fb::<I>),
+                    update_cursor: None,
+                    present_blob: None,
+                    release_blob: None,
+                    get_resize_efd: None,
+                    take_display_size: None,
                 },
             },
         }
