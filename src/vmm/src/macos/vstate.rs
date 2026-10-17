@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
-use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK};
+use super::super::{FC_EXIT_CODE_GENERIC_ERROR, FC_EXIT_CODE_OK, FC_EXIT_CODE_RESET};
 use crate::vmm_config::machine_config::CpuFeaturesTemplate;
 
 use arch::ArchMemoryInfo;
@@ -414,6 +414,10 @@ impl Vcpu {
                     info!("vCPU {vcpuid} received shutdown signal");
                     Ok(VcpuEmulation::Stopped)
                 }
+                VcpuExit::Reset => {
+                    info!("vCPU {vcpuid} received reset signal");
+                    Ok(VcpuEmulation::Reset)
+                }
                 VcpuExit::SystemRegister => {
                     debug!("vCPU {vcpuid} accessed a system register");
                     Ok(VcpuEmulation::Handled)
@@ -497,9 +501,14 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
                 }
-                // The guest was rebooted or halted.
+                // The guest was halted.
                 Ok(VcpuEmulation::Stopped) => {
                     self.exit(FC_EXIT_CODE_OK);
+                    break;
+                }
+                // The guest was rebooted.
+                Ok(VcpuEmulation::Reset) => {
+                    self.exit(FC_EXIT_CODE_RESET);
                     break;
                 }
                 // Emulation errors lead to vCPU exit.
@@ -653,6 +662,7 @@ impl VcpuHandle {
 enum VcpuEmulation {
     Handled,
     Interrupted,
+    Reset,
     Stopped,
     WaitForEvent,
     WaitForEventExpired,

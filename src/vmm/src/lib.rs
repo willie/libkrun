@@ -73,6 +73,8 @@ pub const FC_EXIT_CODE_OK: u8 = 0;
 pub const FC_EXIT_CODE_GENERIC_ERROR: u8 = 1;
 /// Generic exit code for an error considered not possible to occur if the program logic is sound.
 pub const FC_EXIT_CODE_UNEXPECTED_ERROR: u8 = 2;
+/// The guest asked to reboot. The same code as crosvm's `VmReset`.
+pub const FC_EXIT_CODE_RESET: u8 = 32;
 /// Firecracker was shut down after intercepting a restricted system call.
 pub const FC_EXIT_CODE_BAD_SYSCALL: u8 = 148;
 /// Firecracker was shut down after intercepting `SIGBUS`.
