@@ -410,6 +410,10 @@ impl Vcpu {
                     debug!("vCPU {vcpuid} SMC");
                     Ok(VcpuEmulation::Handled)
                 }
+                VcpuExit::Reset => {
+                    info!("vCPU {vcpuid} received reset signal");
+                    Ok(VcpuEmulation::Reset)
+                }
                 VcpuExit::Shutdown => {
                     info!("vCPU {vcpuid} received shutdown signal");
                     Ok(VcpuEmulation::Stopped)
@@ -497,14 +501,18 @@ impl Vcpu {
                 Ok(VcpuEmulation::WaitForEventTimeout(timeout)) => {
                     self.wait_for_event(hvf_vcpuid, &wfe_receiver, Some(timeout), &hvf_vcpu)
                 }
-                // The guest was rebooted or halted.
+                Ok(VcpuEmulation::Reset) => {
+                    self.exit(VcpuResponse::Reset);
+                    break;
+                }
+                // The guest was halted.
                 Ok(VcpuEmulation::Stopped) => {
-                    self.exit(FC_EXIT_CODE_OK);
+                    self.exit(VcpuResponse::Exited(FC_EXIT_CODE_OK));
                     break;
                 }
                 // Emulation errors lead to vCPU exit.
                 Err(_) => {
-                    self.exit(FC_EXIT_CODE_GENERIC_ERROR);
+                    self.exit(VcpuResponse::Exited(FC_EXIT_CODE_GENERIC_ERROR));
                     break;
                 }
             }
@@ -573,10 +581,10 @@ impl Vcpu {
         }
     }
 
-    fn exit(&mut self, exit_code: u8) {
+    fn exit(&mut self, response: VcpuResponse) {
         self.response_sender
-            .send(VcpuResponse::Exited(exit_code))
-            .expect("failed to send Exited status");
+            .send(response)
+            .expect("failed to send exit status");
 
         if let Err(e) = self.exit_evt.write(1) {
             error!("Failed signaling vcpu exit event: {e}");
@@ -610,6 +618,8 @@ pub enum VcpuResponse {
     Resumed,
     /// Vcpu is stopped.
     Exited(u8),
+    /// The guest asked for a reset.
+    Reset,
 }
 
 /// Wrapper over Vcpu that hides the underlying interactions with the Vcpu thread.
@@ -653,6 +663,7 @@ impl VcpuHandle {
 enum VcpuEmulation {
     Handled,
     Interrupted,
+    Reset,
     Stopped,
     WaitForEvent,
     WaitForEventExpired,
